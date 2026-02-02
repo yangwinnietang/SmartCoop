@@ -1,77 +1,79 @@
-# 🐔 SmartCoop Monitor (智能鸡舍监控系统)
+# \ud83d\udc14 SmartCoop Monitor (\u667a\u80fd\u9e21\u820d\u76d1\u63a7\u7cfb\u7edf)
 
-基于 ESP32-S3 的智能鸡舍环境监控系统，集成了实时视频流传输与氨气浓度监测功能。
+\u57fa\u4e8e ESP32-S3 \u7684\u667a\u80fd\u9e21\u820d\u73af\u5883\u76d1\u63a7\u7cfb\u7edf\uff0c\u96c6\u6210\u4e86\u5b9e\u65f6\u89c6\u9891\u6d41\u4f20\u8f93\u4e0e\u6c28\u6c14\u6d53\u5ea6\u76d1\u6d4b\u529f\u80fd\u3002
 
-## 📋 项目简介
+## \ud83d\udccb \u9879\u76ee\u7b80\u4ecb
 
-本项目运行于 **DFRobot Romeo ESP32-S3** 开发板，主要功能包括：
-1. **实时视频监控**: 通过 OV3660 摄像头提供 MJPEG 视频流。
-2. **环境监测**: 集成 MQ-137 氨气传感器与 **SHT30** 温湿度传感器。
-3. **Web 控制台**: 现代化 Web UI，支持实时数据刷新 (1-2s 频率) 与摄像头开关控制。
-4. **电源管理**: 集成 AXP313A 电源管理驱动 (解决 I2C 冲突)。
+\u672c\u9879\u76ee\u8fd0\u884c\u4e8e **DFRobot Romeo ESP32-S3** \u5f00\u53d1\u677f\uff0c\u4e3b\u8981\u529f\u80fd\u5305\u62ec\uff0c
+1. **\u5b9e\u65f6\u89c6\u9891\u76d1\u63a7**: \u901a\u8fc7 OV3660 \u6444\u50cf\u5934\u63d0\u4f9b MJPEG \u89c6\u9891\u6d41\u3002
+2. **\u73af\u5883\u76d1\u6d4b**: \u96c6\u6210 MQ-137 \u6c28\u6c14\u4f20\u611f\u5668\u4e0e **SHT30** \u6e29\u6e7f\u5ea6\u4f20\u611f\u5668\u3002
+3. **Web \u63a7\u5236\u53f0**: \u73b0\u4ee3\u5316 Web UI\uff0c\u652f\u6301\u5b9e\u65f6\u6570\u636e\u5237\u65b0 (1-2s \u9891\u7387) \u4e0e\u6444\u50cf\u5934\u5f00\u5173\u63a7\u5236\u3002
+4. **\u7535\u6e90\u7ba1\u7406**: \u96c6\u6210 AXP313A \u7535\u6e90\u7ba1\u7406\u9a71\u52a8 (\u89e3\u51b3 I2C \u51b2\u7a81)\u3002
 
-## 🛠️ 硬件配置
+## \ud83d\udee0\ufe0f \u786c\u4ef6\u914d\u7f6e
 
-| 组件 | 型号/备注 | 连接引脚 |
+| \u7ec4\u4ef6 | \u578b\u53f7/\u5907\u6ce8 | \u8fde\u63a5\u5f15\u811a |
 | :--- | :--- | :--- |
-| **主控板** | DFRobot Romeo ESP32-S3 | - |
-| **摄像头** | OV3660 (或 OV2640) | DVP 接口 (板载接口) |
-| **氨气传感器** | MQ-137 模块 | 模拟输出 -> **GPIO 3** (ADC1_CH2) |
-| **温湿度传感器** | SHT30 模块 | I2C (SDA: **IO16**, SCL: **IO17**) |
-| **电源管理** | AXP313A (板载) | I2C (SDA: IO1, SCL: IO2) |
+| **\u4e3b\u63a7\u677f** | DFRobot Romeo ESP32-S3 | - |
+| **\u6444\u50cf\u5934** | OV3660 (\u6216 OV2640) | DVP \u63a5\u53e3 (\u677f\u8f7d\u63a5\u53e3) |
+| **\u6c28\u6c14\u4f20\u611f\u5668** | MQ-137 \u6a21\u5757 | \u6a21\u62df\u8f93\u51fa -> **GPIO 3** (ADC1_CH2) |
+| **\u6e29\u6e7f\u5ea6\u4f20\u611f\u5668** | SHT30 \u6a21\u5757 | I2C (SDA: **IO16**, SCL: **IO17**) |
+| **\u7535\u6e90\u7ba1\u7406** | AXP313A (\u677f\u8f7d) | I2C (SDA: IO1, SCL: IO2) |
 
-> ⚠️ **注意**: MQ-137 传感器需接 **GPIO 3**。原计划使用的 GPIO 4 与摄像头数据线冲突，不可使用。
+> \u26a0\ufe0f **\u6ce8\u610f**: MQ-137 \u4f20\u611f\u5668\u9700\u63a5 **GPIO 3**\u3002\u539f\u8ba1\u5212\u4f7f\u7528\u7684 GPIO 4 \u4e0e\u6444\u50cf\u5934\u6570\u636e\u7ebf\u51b2\u7a81\uff0c\u4e0d\u53ef\u4f7f\u7528\u3002
 
-## 🚀 快速开始
+## \ud83d\ude80 \u5feb\u901f\u5f00\u59cb
 
-### 1. 环境准备
-- 安装 [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/index.html) (推荐 v5.4)
-- 配置环境变量 (`export.bat` / `. ./export.sh`)
+### 1. \u73af\u5883\u51c6\u5907
+- \u5b89\u88c5 [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/index.html) (\u63a8\u8350 v5.4)
+- \u914d\u7f6e\u73af\u5883\u53d8\u91cf (`export.bat` / `. ./export.sh`)
 
-### 2. 编译与烧录
+### 2. \u7f16\u8bd1\u4e0e\u70e7\u5f55
 
 ```powershell
-# 进入项目目录
+# \u8fdb\u5165\u9879\u76ee\u76ee\u5f55
 cd SmartCoop
 
-# 编译
+# \u7f16\u8bd1
 idf.py build
 
-# 烧录并打开监视器 (替换 COMx 为实际端口)
+# \u70e7\u5f55\u5e76\u5f00\u542f\u76d1\u89c6\u5668 (\u66ff\u6362 COMx \u4e3a\u5b9e\u9645\u7aef\u53e3)
 idf.py -p COMx flash monitor
 ```
 
-### 3. 使用说明
-1. 设备启动后会自动连接 WiFi (SSID: `wlwdswifi`, PWD: `12345678`)。
-2. 查看串口日志获取设备 IP 地址 (例如 `192.168.1.100`)。
-3. 浏览器访问 `http://<设备IP>/` 进入控制台。
-4. **摄像头默认为关闭状态**，点击页面上的"开启摄像头"按钮即可查看画面。
+### 3. \u4f7f\u7528\u8bf4\u660e
+1. \u8bbe\u5907\u542f\u52a8\u540e\u4f1a\u81ea\u52a8\u8fde\u63a5 WiFi (SSID: `wlwdswifi`, PWD: `12345678`)\u3002
+2. \u67e5\u770b\u4e32\u53e3\u65e5\u5fd7\u83b7\u53d6\u8bbe\u5907 IP \u5730\u5740 (\u4f8b\u5982 `192.168.1.100`)\u3002
+3. \u6d4f\u89c8\u5668\u8bbf\u95ee `http://<\u8bbe\u5907IP>/` \u8fdb\u5165\u63a7\u5236\u53f0\u3002
+4. **\u6444\u50cf\u5934\u9ed8\u8ba4\u4e3a\u5173\u95ed\u72b6\u6001**\uff0c\u70b9\u51fb\u9875\u9762\u4e0a\u7684"\u5f00\u542f\u6444\u50cf\u5934"\u6309\u94ae\u5373\u53ef\u67e5\u770b\u753b\u9762\u3002
 
-## ⚙️ 技术细节
+## \u2699\ufe0f \u6280\u672f\u7ec6\u8282
 
-### I2C 驱动冲突解决
-由于 AXP313A 电源芯片与摄像头 (SCCB) 共用 I2C 引脚 (IO1, IO2)，且 ESP32-Camera 驱动使用了新版 I2C 驱动，导致初始化冲突。
-**解决方案**:
-- 重写了 `axp313a.c` 驱动。
-- 采用 **Transient Bus (瞬态总线)** 模式：每次读写寄存器时创建 I2C 总线，操作完立即释放。
-- 确保在摄像头初始化时，I2C 引脚处于空闲状态。
+### I2C \u9a71\u52a8\u51b2\u7a81\u89e3\u51b3
+\u7531\u4e8e AXP313A \u7535\u6e90\u82af\u7247\u4e0e\u6444\u50cf\u5934 (SCCB) \u5171\u7528 I2C \u5f15\u811a (IO1, IO2)\uff0c\u4e14 ESP32-Camera \u9a71\u52a8\u4f7f\u7528\u4e86\u65b0\u7248 I2C \u9a71\u52a8\uff0c\u5bfc\u81f4\u521d\u59cb\u5316\u51b2\u7a81\u3002
+**\u89e3\u51b3\u65b9\u6848**:
+- \u91cd\u5199\u4e86 `axp313a.c` \u9a71\u52a8\u3002
+- \u91c7\u7528 **Transient Bus (\u77ac\u6001\u603b\u7ebf)** \u6a21\u5f0f\uff1a\u6bcf\u6b21\u8bfb\u5199\u5bc4\u5b58\u5668\u65f6\u521b\u5efa I2C \u603b\u7ebf\uff0c\u64cd\u4f5c\u5b8c\u7acb\u5373\u91ca\u653e\u3002
+- \u786e\u4fdd\u5728\u6444\u50cf\u5934\u521d\u59cb\u5316\u65f6\uff0cI2C \u5f15\u811a\u5904\u4e8e\u7a7a\u95f2\u72b6\u6001\u3002
 
-### ADC 校准
-- 使用 `esp_adc/adc_cali_scheme.h` 中的曲线拟合 (Curve Fitting) 方案。
-- 针对 ESP32-S3 ADC1 进行校准，提供准确的电压读数。
+### ADC \u6821\u51c6
+- \u4f7f\u7528 `esp_adc/adc_cali_scheme.h` \u4e2d\u7684\u66f2\u7ebf\u62df\u5408 (Curve Fitting) \u65b9\u6848\u3002
+- \u9488\u5bf9 ESP32-S3 ADC1 \u8fdb\u884c\u6821\u51c6\uff0c\u63d0\u4f9b\u51c6\u786e\u7684\u7535\u538b\u8bfb\u6570\u3002
 
-## 📂 目录结构
+## \ud83d\udcc1 \u76ee\u5f55\u7ed3\u6784
 
 ```
 SmartCoop/
 ├── main/
-│   ├── main.c           # 主程序 (Web服务器, 传感器任务, 摄像头控制)
-│   ├── axp313a.c        # 电源管理驱动 (解决 I2C 冲突)
-│   ├── axp313a.h        # 电源管理头文件
-│   └── idf_component.yml # 组件依赖 (esp32-camera)
-├── CMakeLists.txt       # 构建脚本
-└── README.md            # 项目说明文档
+│   ├── main.c           # \u4e3b\u7a0b\u5e8f (Web\u670d\u52a1\u5668, \u4f20\u611f\u5668\u4efb\u52a1, \u6444\u50cf\u5934\u63a7\u5236)
+│   ├── axp313a.c        # \u7535\u6e90\u7ba1\u7406\u9a71\u52a8 (\u89e3\u51b3 I2C \u51b2\u7a81)
+│   ├── axp313a.h        # \u7535\u6e90\u7ba1\u7406\u5934\u6587\u4ef6
+│   ├── sht30.c          # SHT30 \u6e29\u6e7f\u5ea6\u4f20\u611f\u5668\u9a71\u52a8
+│   ├── sht30.h          # SHT30 \u9a71\u52a8\u5934\u6587\u4ef6
+│   └── idf_component.yml # \u7ec4\u4ef6\u4fad\u8d56 (esp32-camera)
+├── CMakeLists.txt       # \u6784\u5efa\u811a\u672c
+└── README.md            # \u9879\u76ee\u8bf4\u660e\u6587\u6863
 ```
 
-## 📝 许可证
+## \ud83d\udcdd \u8bb8\u53ef\u8bc1
 MIT License
