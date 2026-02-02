@@ -1,4 +1,7 @@
 #include "axp313a.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_camera.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -8,6 +11,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "sht30.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -15,6 +19,29 @@ static const char *TAG = "SmartCoop";
 
 // Store IP address for display
 static char s_ip_addr[16] = "0.0.0.0";
+
+// ==========================================
+// MQ-137 Ammonia Sensor Configuration (GPIO 3)
+// ==========================================
+#define MQ137_ADC_CHANNEL ADC_CHANNEL_2 // GPIO 3 -> ADC1_CH2
+#define MQ137_ADC_ATTEN ADC_ATTEN_DB_12 // 0-3.3V range
+
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static adc_cali_handle_t adc_cali_handle = NULL;
+static volatile int g_ammonia_raw = 0;
+static volatile int g_ammonia_voltage_mv = 0;
+
+// ==========================================
+// SHT30 Temperature & Humidity Data
+// ==========================================
+static volatile float g_temperature = 0.0f;
+static volatile float g_humidity = 0.0f;
+
+// ==========================================
+// Camera State Control
+// ==========================================
+static volatile bool g_camera_enabled = false;
+static volatile bool g_camera_initialized = false;
 
 // ==========================================
 // WiFi Configuration
@@ -130,9 +157,90 @@ static esp_err_t wifi_init_sta(void) {
 }
 
 // ==========================================
+// MQ-137 ADC Initialization
+// ==========================================
+static esp_err_t init_mq137_adc(void) {
+  // ADC1 Unit Init
+  adc_oneshot_unit_init_cfg_t init_config = {
+      .unit_id = ADC_UNIT_1,
+  };
+  ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+  // ADC1 Channel Config
+  adc_oneshot_chan_cfg_t config = {
+      .bitwidth = ADC_BITWIDTH_DEFAULT,
+      .atten = MQ137_ADC_ATTEN,
+  };
+  ESP_ERROR_CHECK(
+      adc_oneshot_config_channel(adc1_handle, MQ137_ADC_CHANNEL, &config));
+
+  // ADC Calibration
+  adc_cali_curve_fitting_config_t cali_config = {
+      .unit_id = ADC_UNIT_1,
+      .atten = MQ137_ADC_ATTEN,
+      .bitwidth = ADC_BITWIDTH_DEFAULT,
+  };
+  esp_err_t ret =
+      adc_cali_create_scheme_curve_fitting(&cali_config, &adc_cali_handle);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "ADC calibration scheme not supported, using raw values");
+    adc_cali_handle = NULL;
+  }
+
+  ESP_LOGI(TAG, "MQ-137 ADC initialized on GPIO 3 (ADC1_CH2)");
+  return ESP_OK;
+}
+
+// ==========================================
+// MQ-137 Data Reading Task
+// ==========================================
+static void mq137_task(void *arg) {
+  int raw_value = 0;
+  int voltage = 0;
+
+  while (true) {
+    esp_err_t ret =
+        adc_oneshot_read(adc1_handle, MQ137_ADC_CHANNEL, &raw_value);
+    if (ret == ESP_OK) {
+      g_ammonia_raw = raw_value;
+
+      if (adc_cali_handle) {
+        adc_cali_raw_to_voltage(adc_cali_handle, raw_value, &voltage);
+        g_ammonia_voltage_mv = voltage;
+      } else {
+        // Approximate conversion without calibration (12-bit, 3.3V)
+        g_ammonia_voltage_mv = (raw_value * 3300) / 4095;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500)); // Read every 500ms
+  }
+}
+
+// ==========================================
+// SHT30 Data Reading Task
+// ==========================================
+static void sht30_task(void *arg) {
+  float temp, hum;
+
+  while (true) {
+    if (sht30_read(&temp, &hum) == ESP_OK) {
+      g_temperature = temp;
+      g_humidity = hum;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Read every 2 seconds
+  }
+}
+
+// ==========================================
 // Camera Initialization
 // ==========================================
 static esp_err_t init_camera(void) {
+  if (g_camera_initialized) {
+    ESP_LOGI(TAG, "Camera already initialized");
+    return ESP_OK;
+  }
+
   camera_config_t config = {
       .ledc_channel = LEDC_CHANNEL_0,
       .ledc_timer = LEDC_TIMER_0,
@@ -192,7 +300,29 @@ static esp_err_t init_camera(void) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 
+  g_camera_initialized = true;
+  g_camera_enabled = true;
   ESP_LOGI(TAG, "Camera initialized successfully!");
+  return ESP_OK;
+}
+
+// ==========================================
+// Camera Deinitialization
+// ==========================================
+static esp_err_t deinit_camera(void) {
+  if (!g_camera_initialized) {
+    return ESP_OK;
+  }
+
+  esp_err_t err = esp_camera_deinit();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Camera deinit failed with error 0x%x", err);
+    return err;
+  }
+
+  g_camera_initialized = false;
+  g_camera_enabled = false;
+  ESP_LOGI(TAG, "Camera deinitialized");
   return ESP_OK;
 }
 
@@ -207,6 +337,12 @@ static const char *STREAM_PART =
     "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+  if (!g_camera_enabled || !g_camera_initialized) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_send(req, "Camera is off", 13);
+    return ESP_OK;
+  }
+
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
   char part_buf[64];
@@ -222,7 +358,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   ESP_LOGI(TAG, "Stream started");
 
-  while (true) {
+  while (g_camera_enabled && g_camera_initialized) {
     fb = esp_camera_fb_get();
     if (!fb) {
       ESP_LOGW(TAG, "Camera capture failed, retrying...");
@@ -273,48 +409,210 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
-// Root handler - simple HTML page with embedded stream and auto-reconnect
+// ==========================================
+// Ammonia API Handler
+// ==========================================
+static esp_err_t ammonia_handler(httpd_req_t *req) {
+  char response[128];
+  snprintf(response, sizeof(response), "{\"raw\":%d,\"voltage_mv\":%d}",
+           g_ammonia_raw, g_ammonia_voltage_mv);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, strlen(response));
+}
+
+// ==========================================
+// SHT30 API Handler
+// ==========================================
+static esp_err_t sht30_handler(httpd_req_t *req) {
+  char response[128];
+  snprintf(response, sizeof(response),
+           "{\"temperature\":%.1f,\"humidity\":%.1f}", g_temperature,
+           g_humidity);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, strlen(response));
+}
+
+// ==========================================
+// Camera Control Handlers
+// ==========================================
+static esp_err_t camera_on_handler(httpd_req_t *req) {
+  esp_err_t ret = init_camera();
+  const char *response =
+      ret == ESP_OK ? "{\"status\":\"on\"}" : "{\"status\":\"error\"}";
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, strlen(response));
+}
+
+static esp_err_t camera_off_handler(httpd_req_t *req) {
+  g_camera_enabled = false;
+  vTaskDelay(pdMS_TO_TICKS(200)); // Allow stream to stop
+
+  esp_err_t ret = deinit_camera();
+  const char *response =
+      ret == ESP_OK ? "{\"status\":\"off\"}" : "{\"status\":\"error\"}";
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, strlen(response));
+}
+
+static esp_err_t camera_status_handler(httpd_req_t *req) {
+  char response[64];
+  snprintf(response, sizeof(response), "{\"enabled\":%s,\"initialized\":%s}",
+           g_camera_enabled ? "true" : "false",
+           g_camera_initialized ? "true" : "false");
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, strlen(response));
+}
+
+// ==========================================
+// Root Handler - Web UI
+// ==========================================
 static esp_err_t index_handler(httpd_req_t *req) {
   const char *html =
       "<!DOCTYPE html>"
-      "<html><head><title>SmartCoop Camera</title>"
+      "<html><head><title>SmartCoop Monitor</title>"
       "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+      "<meta charset='UTF-8'>"
       "<style>"
-      "body{font-family:Arial,sans-serif;background:#1a1a2e;color:white;text-"
-      "align:center;padding:20px;margin:0;}"
-      "h1{color:#00d4ff;}"
-      "#stream{max-width:100%;border:3px solid #00d4ff;border-radius:10px;}"
-      "#status{color:#ff6b6b;margin:10px;}"
-      ".online{color:#4caf50 !important;}"
+      "*{box-sizing:border-box;margin:0;padding:0;}"
+      "body{font-family:'Segoe UI',Arial,sans-serif;background:linear-gradient("
+      "135deg,#1a1a2e 0%,#16213e "
+      "100%);color:#fff;min-height:100vh;padding:20px;}"
+      ".container{max-width:800px;margin:0 auto;}"
+      "h1{text-align:center;color:#00d4ff;margin-bottom:20px;font-size:1.8em;"
+      "text-shadow:0 0 20px rgba(0,212,255,0.5);}"
+      ".card{background:rgba(255,255,255,0.1);border-radius:16px;padding:20px;"
+      "margin-bottom:20px;backdrop-filter:blur(10px);border:1px solid "
+      "rgba(255,255,255,0.1);}"
+      ".card-title{font-size:1.2em;color:#00d4ff;margin-bottom:15px;display:"
+      "flex;"
+      "align-items:center;gap:10px;}"
+      ".card-title::before{content:'';width:4px;height:20px;background:#00d4ff;"
+      "border-radius:2px;}"
+      ".sensor-data{display:flex;justify-content:space-around;text-align:"
+      "center;}"
+      ".sensor-item{padding:15px;}"
+      ".sensor-value{font-size:2.5em;font-weight:bold;color:#4caf50;}"
+      ".sensor-label{color:#aaa;font-size:0.9em;margin-top:5px;}"
+      ".camera-container{text-align:center;}"
+      "#stream{max-width:100%;border-radius:12px;background:#000;display:none;}"
+      ".camera-placeholder{background:rgba(0,0,0,0.3);border-radius:12px;"
+      "padding:60px;"
+      "color:#666;font-size:1.2em;}"
+      ".btn{padding:12px "
+      "30px;font-size:1em;border:none;border-radius:8px;cursor:pointer;"
+      "transition:all 0.3s;margin:10px 5px;font-weight:bold;}"
+      ".btn-on{background:linear-gradient(135deg,#4caf50,#45a049);color:#fff;}"
+      ".btn-off{background:linear-gradient(135deg,#f44336,#d32f2f);color:#fff;}"
+      ".btn:hover{transform:translateY(-2px);box-shadow:0 5px 20px "
+      "rgba(0,0,0,0.3);}"
+      ".btn:disabled{opacity:0.5;cursor:not-allowed;transform:none;}"
+      ".status{display:inline-block;padding:5px "
+      "12px;border-radius:20px;font-size:0.85em;}"
+      ".status-on{background:#4caf50;}"
+      ".status-off{background:#666;}"
       "</style></head><body>"
-      "<h1>SmartCoop Camera Stream</h1>"
-      "<p id='status' class='online'>Connected</p>"
-      "<img id='stream' src='/stream' alt='Camera Stream'>"
+      "<div class='container'>"
+      "<h1>\uD83D\uDC13 SmartCoop Monitor</h1>"
+
+      "<div class='card'>"
+      "<div class='card-title'>\u6C28\u6C14\u4F20\u611F\u5668 (MQ-137)</div>"
+      "<div class='sensor-data'>"
+      "<div class='sensor-item'>"
+      "<div class='sensor-value' id='voltage'>--</div>"
+      "<div class='sensor-label'>\u7535\u538B (mV)</div>"
+      "</div>"
+      "<div class='sensor-item'>"
+      "<div class='sensor-value' id='raw'>--</div>"
+      "<div class='sensor-label'>ADC \u539F\u59CB\u503C</div>"
+      "</div>"
+      "</div></div>"
+
+      "<div class='card'>"
+      "<div class='card-title'>\u6E29\u6E7F\u5EA6\u4F20\u611F\u5668 (SHT30)</div>"
+      "<div class='sensor-data'>"
+      "<div class='sensor-item'>"
+      "<div class='sensor-value' id='temp'>--</div>"
+      "<div class='sensor-label'>\u6E29\u5EA6 (\u00B0C)</div>"
+      "</div>"
+      "<div class='sensor-item'>"
+      "<div class='sensor-value' id='hum'>--</div>"
+      "<div class='sensor-label'>\u6E7F\u5EA6 (%)</div>"
+      "</div>"
+      "</div></div>"
+
+      "<div class='card'>"
+      "<div class='card-title'>\u6444\u50CF\u5934\u76D1\u63A7 "
+      "<span class='status status-off' id='cam-status'>\u5173\u95ED</span></div>"
+      "<div class='camera-container'>"
+      "<div class='camera-placeholder' id='placeholder'>\uD83D\uDCF7 \u6444\u50CF\u5934\u5DF2\u5173\u95ED</div>"
+      "<img id='stream' src='' alt='Camera Stream'>"
+      "<div style='margin-top:15px;'>"
+      "<button class='btn btn-on' id='btn-on' "
+      "onclick='cameraOn()'>\u5F00\u542F\u6444\u50CF\u5934</button>"
+      "<button class='btn btn-off' id='btn-off' onclick='cameraOff()' "
+      "disabled>\u5173\u95ED\u6444\u50CF\u5934</button>"
+      "</div></div></div>"
+
+      "</div>"
       "<script>"
-      "var img=document.getElementById('stream');"
-      "var status=document.getElementById('status');"
-      "var reconnectTimer=null;"
-      "function reconnect(){"
-      "  status.textContent='Reconnecting...';"
-      "  status.className='';"
-      "  img.src='/stream?t='+Date.now();"
+      "function updateAmmonia(){"
+      "fetch('/api/ammonia').then(r=>r.json()).then(d=>{"
+      "document.getElementById('voltage').textContent=d.voltage_mv;"
+      "document.getElementById('raw').textContent=d.raw;"
+      "}).catch(e=>console.log('Ammonia fetch error'));"
       "}"
-      "img.onerror=function(){"
-      "  status.textContent='Connection lost';"
-      "  status.className='';"
-      "  if(!reconnectTimer)reconnectTimer=setTimeout(function(){"
-      "    reconnectTimer=null;reconnect();"
-      "  },2000);"
-      "};"
-      "img.onload=function(){"
-      "  status.textContent='Connected';"
-      "  status.className='online';"
-      "  clearTimeout(reconnectTimer);"
-      "  reconnectTimer=null;"
-      "};"
-      "setInterval(function(){"
-      "  if(img.complete && img.naturalHeight===0)reconnect();"
-      "},5000);"
+      "function updateSHT30(){"
+      "fetch('/api/sht30').then(r=>r.json()).then(d=>{"
+      "document.getElementById('temp').textContent=d.temperature.toFixed(1);"
+      "document.getElementById('hum').textContent=d.humidity.toFixed(1);"
+      "}).catch(e=>console.log('SHT30 fetch error'));"
+      "}"
+      "function updateCameraStatus(){"
+      "fetch('/api/camera/status').then(r=>r.json()).then(d=>{"
+      "var st=document.getElementById('cam-status');"
+      "var img=document.getElementById('stream');"
+      "var ph=document.getElementById('placeholder');"
+      "var btnOn=document.getElementById('btn-on');"
+      "var btnOff=document.getElementById('btn-off');"
+      "if(d.enabled&&d.initialized){"
+      "st.textContent='\u8FD0\u884C\u4E2D';st.className='status status-on';"
+      "img.style.display='block';ph.style.display='none';"
+      "if(!img.src.includes('/stream'))img.src='/stream?t='+Date.now();"
+      "btnOn.disabled=true;btnOff.disabled=false;"
+      "}else{"
+      "st.textContent='\u5173\u95ED';st.className='status status-off';"
+      "img.style.display='none';img.src='';ph.style.display='block';"
+      "btnOn.disabled=false;btnOff.disabled=true;"
+      "}"
+      "}).catch(e=>console.log('Camera status error'));"
+      "}"
+      "function cameraOn(){"
+      "document.getElementById('btn-on').disabled=true;"
+      "fetch('/api/camera/on',{method:'POST'}).then(()=>{"
+      "setTimeout(updateCameraStatus,500);"
+      "});"
+      "}"
+      "function cameraOff(){"
+      "document.getElementById('btn-off').disabled=true;"
+      "document.getElementById('stream').src='';"
+      "fetch('/api/camera/off',{method:'POST'}).then(()=>{"
+      "setTimeout(updateCameraStatus,500);"
+      "});"
+      "}"
+      "setInterval(updateAmmonia,1000);"
+      "setInterval(updateSHT30,2000);"
+      "setInterval(updateCameraStatus,3000);"
+      "updateAmmonia();updateSHT30();updateCameraStatus();"
       "</script>"
       "</body></html>";
 
@@ -322,12 +620,15 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, html, strlen(html));
 }
 
+// ==========================================
+// Start Web Server
+// ==========================================
 static httpd_handle_t start_webserver(void) {
   httpd_handle_t server = NULL;
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
-  config.max_uri_handlers = 4;
+  config.max_uri_handlers = 10;
   config.lru_purge_enable = true; // Enable LRU purge for sockets
   config.recv_wait_timeout = 30;  // 30 second receive timeout
   config.send_wait_timeout = 30;  // 30 second send timeout
@@ -336,18 +637,52 @@ static httpd_handle_t start_webserver(void) {
   ESP_LOGI(TAG, "Starting HTTP server on port %d", config.server_port);
 
   if (httpd_start(&server, &config) == ESP_OK) {
-    // Register URI handlers
+    // Index page
     httpd_uri_t index_uri = {.uri = "/",
                              .method = HTTP_GET,
                              .handler = index_handler,
                              .user_ctx = NULL};
     httpd_register_uri_handler(server, &index_uri);
 
+    // Stream
     httpd_uri_t stream_uri = {.uri = "/stream",
                               .method = HTTP_GET,
                               .handler = stream_handler,
                               .user_ctx = NULL};
     httpd_register_uri_handler(server, &stream_uri);
+
+    // Ammonia API
+    httpd_uri_t ammonia_uri = {.uri = "/api/ammonia",
+                               .method = HTTP_GET,
+                               .handler = ammonia_handler,
+                               .user_ctx = NULL};
+    httpd_register_uri_handler(server, &ammonia_uri);
+
+    // Camera control APIs
+    httpd_uri_t cam_on_uri = {.uri = "/api/camera/on",
+                              .method = HTTP_POST,
+                              .handler = camera_on_handler,
+                              .user_ctx = NULL};
+    httpd_register_uri_handler(server, &cam_on_uri);
+
+    httpd_uri_t cam_off_uri = {.uri = "/api/camera/off",
+                               .method = HTTP_POST,
+                               .handler = camera_off_handler,
+                               .user_ctx = NULL};
+    httpd_register_uri_handler(server, &cam_off_uri);
+
+    httpd_uri_t cam_status_uri = {.uri = "/api/camera/status",
+                                  .method = HTTP_GET,
+                                  .handler = camera_status_handler,
+                                  .user_ctx = NULL};
+    httpd_register_uri_handler(server, &cam_status_uri);
+
+    // SHT30 API
+    httpd_uri_t sht30_uri = {.uri = "/api/sht30",
+                             .method = HTTP_GET,
+                             .handler = sht30_handler,
+                             .user_ctx = NULL};
+    httpd_register_uri_handler(server, &sht30_uri);
 
     ESP_LOGI(TAG, "HTTP server started successfully");
     return server;
@@ -361,8 +696,8 @@ static httpd_handle_t start_webserver(void) {
 // Main Application Entry Point
 // ==========================================
 void app_main(void) {
-  ESP_LOGI(TAG, "=== SmartCoop Camera System ===");
-  ESP_LOGI(TAG, "DFRobot Romeo ESP32-S3 + OV2640");
+  ESP_LOGI(TAG, "=== SmartCoop Monitor System ===");
+  ESP_LOGI(TAG, "DFRobot Romeo ESP32-S3 + MQ-137 + Camera");
 
   // Initialize NVS (required for WiFi)
   esp_err_t ret = nvs_flash_init();
@@ -388,24 +723,44 @@ void app_main(void) {
     }
   }
 
-  // Step 2: Initialize WiFi
-  ESP_LOGI(TAG, "Step 2: Connecting to WiFi...");
+  // Step 2: Initialize MQ-137 ADC
+  ESP_LOGI(TAG, "Step 2: Initializing MQ-137 ammonia sensor (GPIO 3)...");
+  ret = init_mq137_adc();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "MQ-137 ADC initialization failed");
+    return;
+  }
+
+  // Step 3: Start MQ-137 reading task
+  xTaskCreate(mq137_task, "mq137_task", 2048, NULL, 5, NULL);
+  ESP_LOGI(TAG, "MQ-137 reading task started");
+
+  // Step 4: Initialize SHT30 temperature & humidity sensor
+  ESP_LOGI(TAG, "Step 4: Initializing SHT30 sensor (SDA=IO16, SCL=IO17)...");
+  ret = sht30_init();
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "SHT30 initialization failed (sensor may not be connected)");
+    // Continue anyway - sensor is optional
+  } else {
+    // Start SHT30 reading task
+    xTaskCreate(sht30_task, "sht30_task", 2048, NULL, 5, NULL);
+    ESP_LOGI(TAG, "SHT30 reading task started");
+  }
+
+  // Step 5: Initialize WiFi
+  ESP_LOGI(TAG, "Step 5: Connecting to WiFi...");
+  ;
   ret = wifi_init_sta();
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "WiFi initialization failed");
     return;
   }
 
-  // Step 3: Initialize Camera
-  ESP_LOGI(TAG, "Step 3: Initializing camera...");
-  ret = init_camera();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Camera initialization failed");
-    return;
-  }
+  // Note: Camera NOT initialized by default - user must enable via web UI
 
-  // Step 4: Start HTTP Server
-  ESP_LOGI(TAG, "Step 4: Starting HTTP stream server...");
+  // Step 6: Start HTTP Server
+  ESP_LOGI(TAG, "Step 6: Starting HTTP server...");
+  ;
   httpd_handle_t server = start_webserver();
   if (server == NULL) {
     ESP_LOGE(TAG, "Failed to start web server");
@@ -414,11 +769,13 @@ void app_main(void) {
 
   // Print access info with actual IP
   ESP_LOGI(TAG, "=========================================");
-  ESP_LOGI(TAG, "Camera stream ready!");
+  ESP_LOGI(TAG, "SmartCoop Monitor ready!");
   ESP_LOGI(TAG, "Open browser and navigate to:");
   ESP_LOGI(TAG, "  http://%s/", s_ip_addr);
-  ESP_LOGI(TAG, "Or direct stream:");
-  ESP_LOGI(TAG, "  http://%s/stream", s_ip_addr);
+  ESP_LOGI(TAG, "Features:");
+  ESP_LOGI(TAG, "  - Real-time ammonia sensor data");
+  ESP_LOGI(TAG, "  - Real-time temperature & humidity");
+  ESP_LOGI(TAG, "  - Camera stream (click to enable)");
   ESP_LOGI(TAG, "=========================================");
 
   // Keep running
